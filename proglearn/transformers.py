@@ -4,6 +4,7 @@ Corresponding Email: levinewill@icloud.com
 """
 import keras
 import numpy as np
+import numpy.random as rng
 from itertools import product
 from joblib import Parallel, delayed
 from sklearn.base import BaseEstimator
@@ -13,6 +14,7 @@ from sklearn.utils.validation import check_array, check_is_fitted, check_X_y
 
 from .base import BaseTransformer
 
+from split import BaseObliqueSplitter
 
 class NeuralClassificationTransformer(BaseTransformer):
     """
@@ -274,8 +276,8 @@ class SplitInfo:
         than this threshold for the feature of this split then it will go to the
         left child, otherwise it wil go the right child where these children are
         the children nodes of the node for which this split defines.
-    proj_mat : array of shape [n_components, n_features]
-        The sparse random projection matrix for this split.
+    proj_vec : array of shape [n_features]
+        The vector of the sparse random projection matrix relevant for the split.
     left_impurity : float
         This is Gini impurity of left side of the split.
     left_idx : array of shape [left_n_samples]
@@ -299,7 +301,7 @@ class SplitInfo:
         self,
         feature,
         threshold,
-        proj_mat,
+        proj_vec,
         left_impurity,
         left_idx,
         left_n_samples,
@@ -312,7 +314,7 @@ class SplitInfo:
 
         self.feature = feature
         self.threshold = threshold
-        self.proj_mat = proj_mat
+        self.proj_vec = proj_vec
         self.left_impurity = left_impurity
         self.left_idx = left_idx
         self.left_n_samples = left_n_samples
@@ -335,13 +337,13 @@ class ObliqueSplitter:
         values for each of the features.
     y : array of shape [n_samples]
         The labels for each of the examples in X.
-    proj_dims : int
-        The dimensionality of the target projection space.
-    density : float
-        Ratio of non-zero component in the random projection matrix in the range '(0, 1]'.
+    max_features : float
+        controls the dimensionality of the target projection space.
+    feature_combinations : float
+        controls the density of the projection matrix
     random_state : int
         Controls the pseudo random number generator used to generate the projection matrix.
-    workers : int
+    n_jobs : int
         The number of cores to parallelize the calculation of Gini impurity.
         Supply -1 to use all cores available to the Process.
 
@@ -362,21 +364,44 @@ class ObliqueSplitter:
         Determines the best possible split for the given set of samples.
     """
 
-    def __init__(self, X, y, proj_dims, density, random_state, workers):
+    def __init__(self, X, y, max_features, feature_combinations, random_state, n_jobs):
 
-        self.X = X
-        self.y = y
+        self.X = np.array(X, dtype=np.float64)
 
-        self.classes = np.array(np.unique(y), dtype=int)
-        self.n_classes = len(self.classes)
-        self.indices = np.indices(y.shape)[0]
+        # y must be 1D
+        self.y = np.array(y, dtype=np.float64).squeeze()
 
-        self.n_samples = X.shape[0]
+        classes = np.array(np.unique(y), dtype=int)
+        self.n_classes = len(classes)
+        self.class_indices = {j:i for i, j in enumerate(classes)}
 
-        self.proj_dims = proj_dims
-        self.density = density
+        self.indices = np.indices(self.y.shape)[0]
+
+        self.n_samples = self.X.shape[0]
+        self.n_features = self.X.shape[1]
+
         self.random_state = random_state
-        self.workers = workers
+        rng.seed(random_state)
+
+        # Compute root impurity
+        unique, count = np.unique(y, return_counts=True)
+        count = count / len(y)
+        self.root_impurity = 1 - np.sum(np.power(count, 2))
+
+        # proj_dims = d = mtry
+        self.proj_dims = max(int(max_features * self.n_features), 1)
+       
+        # feature_combinations = mtry_mult
+        # In processingNodeBin.h, mtryDensity = int(mtry * mtry_mult)
+        self.n_non_zeros = max(int(self.proj_dims * feature_combinations), 1)
+
+        # Base oblique splitter in cython
+        self.BOS = BaseObliqueSplitter()
+
+        # Temporary debugging parameter, turns off oblique splits
+        self.debug = False
+
+        self.n_jobs = n_jobs
 
     def sample_proj_mat(self, sample_inds):
         """
@@ -394,14 +419,21 @@ class ObliqueSplitter:
         proj_X : {ndarray, sparse matrix} of shape (n_samples, self.proj_dims)
             Projected input data matrix.
         """
+        
+        if self.debug:
+            return self.X[sample_inds, :], np.eye(self.n_features)
 
-        proj_mat = SparseRandomProjection(
-            density=self.density,
-            n_components=self.proj_dims,
-            random_state=self.random_state,
-        )
+        # This is the way its done in the C++
+        proj_mat = np.zeros((self.n_features, self.proj_dims))
+        rand_feat = rng.randint(self.n_features, size=self.n_non_zeros)
+        rand_dim = rng.randint(self.proj_dims, size=self.n_non_zeros)
+        weights = [1 if rng.rand() > 0.5 else -1 for i in range(self.n_non_zeros)]
+        proj_mat[rand_feat, rand_dim] = weights
 
-        proj_X = proj_mat.fit_transform(self.X[sample_inds, :])
+        # Need to remove zero vectors from projmat
+        proj_mat = proj_mat[:, np.unique(rand_dim)]
+        
+        proj_X = self.X[sample_inds, :] @ proj_mat
         return proj_X, proj_mat
 
     def leaf_label_proba(self, idx):
@@ -426,113 +458,17 @@ class ObliqueSplitter:
         samples = self.y[idx]
         n = len(samples)
         labels, count = np.unique(samples, return_counts=True)
-        most = np.argmax(count)
+       
+        proba = np.zeros(self.n_classes)
+        for i, l in enumerate(labels):
+            class_idx = self.class_indices[l]
+            proba[class_idx] = count[i] / n
 
+        most = np.argmax(count)
         label = labels[most]
-        proba = count[most] / n
+        #max_proba = count[most] / n
 
         return label, proba
-
-    # Returns gini impurity for split
-    # Expects 0 < t < n
-    def score(self, y_sort, t):
-        """
-        Finds the Gini impurity for the split of interest
-
-        Parameters
-        ----------
-        y_sort : array of shape [n_samples]
-            A sorted array of labels for the examples for which the Gini impurity
-            is being calculated.
-        t : float
-            The threshold determining where to split y_sort.
-
-        Returns
-        -------
-        gini : float
-            The Gini impurity of the split.
-        """
-
-        left = y_sort[:t]
-        right = y_sort[t:]
-
-        n_left = len(left)
-        n_right = len(right)
-
-        left_unique, left_counts = np.unique(left, return_counts=True)
-        right_unique, right_counts = np.unique(right, return_counts=True)
-
-        left_counts = left_counts / n_left
-        right_counts = right_counts / n_right
-
-        left_gini = 1 - np.sum(np.power(left_counts, 2))
-        right_gini = 1 - np.sum(np.power(right_counts, 2))
-
-        gini = (n_left / self.n_samples) * left_gini + (
-            n_right / self.n_samples
-        ) * right_gini
-        return gini
-
-    def _score(self, proj_X, y_sample, i, j):
-        """
-        Handles array indexing before calculating Gini impurity
-
-        Parameters
-        ----------
-        proj_X : {ndarray, sparse matrix} of shape (n_samples, self.proj_dims)
-            Projected input data matrix.
-        y_sample : array of shape [n_samples]
-            Labels for sample of data.
-        i : float
-            The threshold determining where to split y_sort.
-        j : float
-            The projection dimension to consider.
-
-        Returns
-        -------
-        gini : float
-            The Gini impurity of the split.
-        i : float
-            The threshold determining where to split y_sort.
-        j : float
-            The projection dimension to consider.
-        """
-        # Sort labels by the jth feature
-        idx = np.argsort(proj_X[:, j])
-        y_sort = y_sample[idx]
-
-        gini = self.score(y_sort, i)
-
-        return gini, i, j
-
-    # Returns impurity for a group of examples
-    # expects idx not None
-    def impurity(self, idx):
-        """
-        Finds the actual impurity for a set of samples
-
-        Parameters
-        ----------
-        idx : array of shape [n_samples]
-            The indices of the nodes in the set for which the impurity is being calculated.
-
-        Returns
-        -------
-        impurity : float
-            Actual impurity of split.
-        """
-
-        samples = self.y[idx]
-        n = len(samples)
-
-        if n == 0:
-            return 0
-
-        unique, count = np.unique(samples, return_counts=True)
-        count = count / n
-        gini = np.sum(np.power(count, 2))
-
-        return 1 - gini
 
     # Finds the best split
     def split(self, sample_inds):
@@ -549,61 +485,48 @@ class ObliqueSplitter:
         split_info : SplitInfo
             Class holding information about the split.
         """
+        # ensure that sample indices are 1D
+        sample_inds = sample_inds.squeeze()
+
+        if not self.y.squeeze().ndim == 1:
+            raise RuntimeError('Does not support multivariate output yet.')
 
         # Project the data
         proj_X, proj_mat = self.sample_proj_mat(sample_inds)
         y_sample = self.y[sample_inds]
         n_samples = len(sample_inds)
 
-        # Score matrix
-        # No split score is just node impurity
-        Q = np.zeros((n_samples, self.proj_dims))
-        node_impurity = self.impurity(sample_inds)
-        Q[0, :] = node_impurity
-        Q[-1, :] = node_impurity
+        # Assign types to everything
+        # TODO: assign types when making the splitter class. This is silly.
+        proj_X = np.array(proj_X, dtype=np.float64)
+        y_sample = np.array(y_sample, dtype=np.float64)
+        sample_inds = np.array(sample_inds, dtype=np.intc)
+        # print(proj_X.shape, y_sample.shape, sample_inds.shape)
 
-        # Loop through examples and projected features to calculate split scores
-        split_iterator = product(range(1, n_samples - 1), range(self.proj_dims))
-        scores = Parallel(n_jobs=self.workers)(
-            delayed(self._score)(proj_X, y_sample, i, j) for i, j in split_iterator
-        )
-        for gini, i, j in scores:
-            Q[i, j] = gini
+        # Call cython splitter 
+        (feature, 
+        threshold, 
+        left_impurity, 
+        left_idx, 
+        right_impurity, 
+        right_idx, 
+        improvement) = self.BOS.best_split(proj_X, y_sample, sample_inds)
 
-        # Identify best split feature, minimum gini impurity
-        best_split_ind = np.argmin(Q)
-        thresh_i, feature = np.unravel_index(best_split_ind, Q.shape)
-        best_gini = Q[thresh_i, feature]
-
-        # Sort samples by the split feature
-        feat_vec = proj_X[:, feature]
-        idx = np.argsort(feat_vec)
-
-        feat_vec = feat_vec[idx]
-        sample_inds = sample_inds[idx]
-
-        # Get the threshold, split samples into left and right
-        threshold = feat_vec[thresh_i]
-        left_idx = sample_inds[:thresh_i]
-        right_idx = sample_inds[thresh_i:]
-
+        # TODO: These are coming out as memory views. Fix this.
+        left_idx = np.asarray(left_idx)
+        right_idx = np.asarray(right_idx)
+    
         left_n_samples = len(left_idx)
         right_n_samples = len(right_idx)
 
-        # See if we have no split
         no_split = left_n_samples == 0 or right_n_samples == 0
 
-        # Evaluate improvement
-        improvement = node_impurity - best_gini
-
-        # Evaluate impurities for left and right children
-        left_impurity = self.impurity(left_idx)
-        right_impurity = self.impurity(right_idx)
+        proj_vec = proj_mat[:, feature]
 
         split_info = SplitInfo(
             feature,
             threshold,
-            proj_mat,
+            proj_vec,
             left_impurity,
             left_idx,
             left_n_samples,
@@ -645,7 +568,7 @@ class Node:
         self.impurity = None
         self.n_samples = None
 
-        self.proj_mat = None
+        self.proj_vec = None
         self.label = None
         self.proba = None
 
@@ -724,9 +647,6 @@ class ObliqueTree:
     ):
 
         # Tree parameters
-        # self.n_samples = n_samples
-        # self.n_features = n_features
-        # self.n_classes = n_classes
         self.depth = 0
         self.node_count = 0
         self.nodes = []
@@ -748,7 +668,7 @@ class ObliqueTree:
         is_leaf,
         feature,
         threshold,
-        proj_mat,
+        proj_vec,
         label,
         proba,
     ):
@@ -774,8 +694,8 @@ class ObliqueTree:
             to this node's left of right child. If a sample has a value less than the
             threshold (for the feature of this node) it will go to the left childe,
             otherwise it will go the right child.
-        proj_mat : {ndarray, sparse matrix} of shape (n_samples, n_features)
-            Projection matrix for this new node.
+        proj_vec : {ndarray, sparse matrix} of shape (n_features)
+            Projection vector for this new node.
         label : int
             The label a sample will be given if it is predicted to be at this node.
         proba : float
@@ -809,7 +729,7 @@ class ObliqueTree:
             node.is_leaf = False
             node.feature = feature
             node.threshold = threshold
-            node.proj_mat = proj_mat
+            node.proj_vec = proj_vec
 
         self.node_count += 1
         self.nodes.append(node)
@@ -835,7 +755,7 @@ class ObliqueTree:
             0,
             1,
             False,
-            self.splitter.impurity(self.splitter.indices),
+            self.splitter.root_impurity,
             self.splitter.indices,
             self.splitter.n_samples,
         )
@@ -892,7 +812,7 @@ class ObliqueTree:
                     is_leaf,
                     split.feature,
                     split.threshold,
-                    split.proj_mat,
+                    split.proj_vec,
                     None,
                     None,
                 )
@@ -942,8 +862,10 @@ class ObliqueTree:
         for i in range(X.shape[0]):
             cur = self.nodes[0]
             while cur is not None and not cur.is_leaf:
-                proj_X = cur.proj_mat.transform(X)
-                if proj_X[i, cur.feature] < cur.threshold:
+               
+                proj_X = X[i] @ cur.proj_vec
+
+                if proj_X < cur.threshold:
                     id = cur.left_child
                     cur = self.nodes[id]
                 else:
@@ -980,9 +902,9 @@ class ObliqueTreeClassifier(BaseEstimator):
         Minimum Gini impurity value that must be achieved for a split to occur on the node.
     feature_combinations : float
         The feature combinations to use for the oblique split.
-    density : float
-        Density estimate.
-    workers : int, optional (default: -1)
+    max_features : float
+        Output dimension = max_features * dimension
+    n_jobs : int, optional (default: -1)
         The number of cores to parallelize the calculation of Gini impurity.
         Supply -1 to use all cores available to the Process.
 
@@ -1003,41 +925,35 @@ class ObliqueTreeClassifier(BaseEstimator):
     def __init__(
         self,
         *,
-        # criterion="gini",
-        # splitter=None,
         max_depth=np.inf,
         min_samples_split=2,
         min_samples_leaf=1,
-        # min_weight_fraction_leaf=0,
-        # max_features="auto",
-        # max_leaf_nodes=None,
         random_state=None,
         min_impurity_decrease=0,
         min_impurity_split=0,
-        # class_weight=None,
-        # ccp_alpha=0.0,
-        # New args
         feature_combinations=1.5,
-        density=0.5,
-        workers=-1,
+        max_features=1,
+        n_jobs=1
     ):
 
-        # self.criterion=criterion
+        # RF parameters
         self.max_depth = max_depth
         self.min_samples_split = min_samples_split
         self.min_samples_leaf = min_samples_leaf
-        # self.min_weight_fraction_leaf=min_weight_fraction_leaf
-        # self.max_features=max_features
-        # self.max_leaf_nodes=max_leaf_nodes
         self.random_state = random_state
         self.min_impurity_decrease = min_impurity_decrease
         self.min_impurity_split = min_impurity_split
-        # self.class_weight=class_weight
-        # self.ccp_alpha=ccp_alpha
 
+        # OF parameters
+        # Feature combinations = L
         self.feature_combinations = feature_combinations
-        self.density = density
-        self.workers = workers
+
+        # Max features
+        self.max_features = max_features
+
+        self.n_jobs=n_jobs
+
+        self.n_classes=None
 
     def fit(self, X, y):
         """
@@ -1056,10 +972,10 @@ class ObliqueTreeClassifier(BaseEstimator):
             The fit classifier.
         """
 
-        self.proj_dims = int(np.ceil(X.shape[1]) / self.feature_combinations)
         splitter = ObliqueSplitter(
-            X, y, self.proj_dims, self.density, self.random_state, self.workers
+            X, y, self.max_features, self.feature_combinations, self.random_state, self.n_jobs
         )
+        self.n_classes = splitter.n_classes
 
         self.tree = ObliqueTree(
             splitter,
@@ -1070,6 +986,7 @@ class ObliqueTreeClassifier(BaseEstimator):
             self.min_impurity_decrease,
         )
         self.tree.build()
+
         return self
 
     def apply(self, X):
@@ -1105,6 +1022,8 @@ class ObliqueTreeClassifier(BaseEstimator):
             The predictions (labels) for each testing sample.
         """
 
+        X = np.array(X, dtype=np.float64)
+
         preds = np.zeros(X.shape[0])
         pred_nodes = self.apply(X)
         for k in range(len(pred_nodes)):
@@ -1128,7 +1047,9 @@ class ObliqueTreeClassifier(BaseEstimator):
             The probabilities of the predictions (labels) for each testing sample.
         """
 
-        preds = np.zeros(X.shape[0])
+        X = np.array(X, dtype=np.float64)
+
+        preds = np.zeros((X.shape[0], self.n_classes))
         pred_nodes = self.apply(X)
         for k in range(len(preds)):
             id = pred_nodes[k]
@@ -1152,7 +1073,6 @@ class ObliqueTreeClassifier(BaseEstimator):
         """
 
         proba = self.predict_proba(X)
-        for k in range(len(proba)):
-            proba[k] = np.log(proba[k])
+        return np.log(proba)
 
-        return proba
+
